@@ -1,26 +1,33 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from database import get_db
-from database.models.accounts import UserModel, UserProfileModel
-from schemas.profiles import ProfileCreateSchema, ProfileResponseSchema
+from database.models.accounts import UserModel, UserProfileModel, UserGroupEnum
+from exceptions import S3FileUploadError
+from schemas.profiles import ProfileCreateSchema, ProfileResponseSchema, get_profile_create_schema
 from security.http import get_token
 from config.dependencies import get_jwt_auth_manager, get_s3_storage_client
 from security.interfaces import JWTAuthManagerInterface
 from storages.interfaces import S3StorageInterface
 
+
 router = APIRouter()
 
 
-@router.post("/{user_id}/profile/", response_model=ProfileResponseSchema, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/users/{user_id}/profile/",
+    response_model=ProfileResponseSchema,
+    status_code=status.HTTP_201_CREATED
+)
 async def create_profile(
-        user_id: int,
-        profile_data: ProfileCreateSchema = Depends(),
-        db: AsyncSession = Depends(get_db),
-        token: str = Depends(get_token),
-        jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager),
-        s3_client: S3StorageInterface = Depends(get_s3_storage_client)
+    user_id: int,
+    profile_data: ProfileCreateSchema = Depends(get_profile_create_schema),
+    db: AsyncSession = Depends(get_db),
+    token: str = Depends(get_token),
+    jwt_manager: JWTAuthManagerInterface = Depends(get_jwt_auth_manager),
+    s3_client: S3StorageInterface = Depends(get_s3_storage_client)
 ):
     try:
         token_data = jwt_manager.decode_access_token(token)
@@ -30,7 +37,20 @@ async def create_profile(
             detail="Token has expired."
         )
 
-    if token_data.get("user_id") != user_id:
+    requesting_user_id = token_data.get("user_id")
+
+    # Check if the requesting user is an admin
+    stmt_requester = select(UserModel).options(selectinload(UserModel.group)).where(UserModel.id == requesting_user_id)
+    result_requester = await db.execute(stmt_requester)
+    requesting_user = result_requester.scalars().first()
+
+    is_admin = (
+        requesting_user is not None
+        and requesting_user.group is not None
+        and requesting_user.group.name == UserGroupEnum.ADMIN
+    )
+
+    if requesting_user_id != user_id and not is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="You don't have permission to edit this profile."
@@ -57,10 +77,10 @@ async def create_profile(
 
     try:
         file_content = await profile_data.avatar.read()
-        file_name = f"{user_id}_{profile_data.avatar.filename}"
-
-        avatar_url = await s3_client.upload_file(file_name, file_content)
-    except Exception:
+        file_name = f"avatars/{user_id}_avatar.jpg"
+        await s3_client.upload_file(file_name, file_content)
+        avatar_url = await s3_client.get_file_url(file_name)
+    except S3FileUploadError:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to upload avatar. Please try again later."
@@ -73,7 +93,7 @@ async def create_profile(
         gender=profile_data.gender,
         date_of_birth=profile_data.date_of_birth,
         info=profile_data.info,
-        avatar=avatar_url
+        avatar=file_name
     )
 
     db.add(new_profile)
